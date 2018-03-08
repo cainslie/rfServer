@@ -1,0 +1,465 @@
+#include <SimpleDHT.h>
+#include <Wire.h>
+#include <Adafruit_BMP085.h>
+#include <EasyDDNS.h>
+#include <SPI.h>
+#include <NRFLite.h>
+#include <ESP8266WiFi.h>
+ 
+//const char* ssid = "DevFluence";
+//const char* password = "W1ck3dsaint!!";
+const char* ssid = "Ainslie";
+const char* password = "ytsurk36552";
+const int MAX_DEVICES = 255;
+const int MAX_RETRIES = 255;
+const String DDNS_DOMAIN = "ainslie.duckdns.org";
+const String DDNS_TOKEN = "3b10c0db-7786-45d2-9413-2a283c2c91e2";
+const int DDNS_UPDATE_INTERVAL = 10000;
+const int SENSOR_REFRESH = 2500;
+const int SENSOR_AVERAGE_INTERVAL = 3600000;
+const static uint8_t RADIO_ID = 0;       // Our radio's id.  The transmitter will send to this id.
+const static uint8_t PIN_RADIO_CE = 2;
+const static uint8_t PIN_RADIO_CSN = 4;
+const int LED_PIN = 13; // GPIO13
+const int PIN_DHT22 = 2;
+const char COMMAND  = B00000001;
+const char STATE    = B00000010;
+const char PIN      = B00000100;
+const char MODE     = B00001000;
+const char TIME     = B00010000;
+const char KEEP_HIGH    = B00100000;
+const char TOGGLE   = B01000000;
+
+WiFiServer server(80);
+WiFiClient client;
+Adafruit_BMP085 bmp;
+NRFLite _radio;
+SimpleDHT22 dht22;
+
+unsigned long refreshMillis, shiftMillis;
+String sendMsg, pageData;
+String requestArray[6];
+bool input6, input7, inputData, bufferReady = false;
+float temperature, humidity, pressure = 0;
+
+struct WeatherData
+{
+  float temperature[5];
+  float humidity[5];
+  float pressure[5];
+};
+
+struct RadioPacket // Any packet up to 32 bytes can be sent.
+{
+    uint8_t FromRadioId;
+    char Payload[28];
+};
+
+struct WebState
+{
+  String deviceID;
+  String command;
+  String state;
+  String pin;
+  String pinCommand;
+  String pinTime;
+};
+
+RadioPacket _radioData;
+RadioPacket _newData;
+WebState webState;
+WeatherData weatherData;
+
+void printBits(byte myByte){
+ for(byte mask = 0x80; mask; mask >>= 1){
+   if(mask  & myByte)
+       Serial.print('1');
+   else
+       Serial.print('0');
+ }
+ Serial.println();
+}
+
+void setup()
+{
+  sendMsg == "";
+    Serial.begin(115200);
+
+    //if (!_radio.init(RADIO_ID, PIN_RADIO_CE, PIN_RADIO_CSN))
+    {
+        Serial.println("Cannot communicate with radio");
+        //while (1); // Wait here forever.
+    } //else
+    {
+      Serial.println("Radio is ready");
+    }
+  Serial.println();
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+ 
+  WiFi.begin(ssid, password);
+  //bmp.begin(); 
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  
+  randomSeed(millis());
+ 
+  // Start the server
+  server.begin();
+  Serial.println("Server started");
+ 
+  // Print the IP address
+  Serial.print("Use this URL to connect: ");
+  Serial.print("http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/");
+  EasyDDNS.service("duckdns");
+  EasyDDNS.client(DDNS_DOMAIN, DDNS_TOKEN);
+  _radioData.FromRadioId = 0;
+  refreshMillis = millis();
+  shiftMillis = millis();
+  Serial.println("All init completed.");
+}
+
+RadioPacket generateResponse(RadioPacket data)
+{
+  RadioPacket reply;
+  String payload, newData;
+  newData = data.Payload;
+  reply.FromRadioId = data.FromRadioId;
+  
+  Serial.print("Received: ");
+  Serial.println(data.Payload);
+
+  if (newData.indexOf("NEW") != -1) {
+      payload = "NEW?2";
+  } else if (newData.indexOf("CND") != -1) {
+      payload = "CMD?Read";
+  } else if (newData.indexOf("MSG") != -1) {
+      payload = "MSG??";
+  } else if (newData.indexOf("FND") != -1) {
+      payload = "FND?I'm here";
+  } else if (newData.indexOf("CNF") != -1) {
+      payload = "CNF?2";
+  } else if (newData.indexOf("INP") != -1) {
+    if (newData.substring(newData.indexOf('?')+1)[0] == '1') { input6 = true; } else { input6 = false; }
+    if (newData.substring(newData.indexOf('?')+1)[1] == '1') { input7 = true; } else { input7 = false; }
+    inputData = true;
+    payload = "ACK";
+  } else if (newData.indexOf("BEAT") != -1) {
+      payload = "BEAT?Thanks";
+  } else 
+  {
+      payload = "Error";
+  }
+  payload.toCharArray(reply.Payload, payload.length()+1);
+  return reply;
+}
+
+bool sendRadioPacket(uint8_t destination, RadioPacket data)
+{
+  bool sent = false;
+  int retryCount = 0;
+  while (!sent)
+  {
+    sent = _radio.send(destination, &data, sizeof(data));
+    return sent;
+    retryCount++;
+    if (retryCount == MAX_RETRIES) { return false; Serial.println("Failed"); break; }
+  }
+}
+
+void doRadioWork()
+{
+    if (_radio.hasData())
+    {
+      _radio.readData(&_radioData); // Note how '&' must be placed in front of the variable name.
+      _newData = generateResponse(_radioData);
+      sendMsg = _newData.Payload;
+      Serial.println("Should reply: " + sendMsg + " to: " + _newData.FromRadioId);
+    }
+      if (sendMsg.length() > 0) {
+      sendMsg.toCharArray(_newData.Payload, sendMsg.length()+1);
+      Serial.print("Sending: ");
+      Serial.println(sendMsg);
+      sendMsg = "";
+      sendRadioPacket(_newData.FromRadioId, _newData);
+    }
+}
+
+void readSensors()
+{
+  int err = SimpleDHTErrSuccess;
+  if ((err = dht22.read2(PIN_DHT22, &temperature, &humidity, NULL)) != SimpleDHTErrSuccess) {
+    Serial.print("Read DHT22 failed, err="); Serial.println(err);delay(2000);
+    return;
+  }
+  temperature = (temperature + bmp.readTemperature())/2; 
+  Serial.print("Sample OK: ");
+  Serial.print((float)temperature); Serial.print(" *C, ");
+  Serial.print((float)humidity); Serial.print(" RH%, ");
+  pressure = bmp.readPressure();
+  Serial.print(pressure/100); Serial.println(" pa");
+}
+
+void shiftSensorData()
+{
+  for (int i=0;i <=4;i++)
+  {
+    weatherData.temperature[i] = weatherData.temperature[i+1];
+    weatherData.pressure[i] = weatherData.pressure[i+1];
+    weatherData.humidity[i] = weatherData.humidity[i+1];
+  }
+  readSensors();
+  weatherData.temperature[5] = temperature;
+  weatherData.pressure[5] = pressure;
+  weatherData.humidity[5] = humidity;
+}
+
+void doWebReply()
+{
+//  client.write(pageData);
+}
+
+String trimRequest(String data)
+{
+  return data.substring(data.indexOf('&')+1);
+}
+
+String getRequestValue(String data)
+{
+  return data.substring(data.indexOf('=')+1, data.indexOf('&'));
+}
+
+void indexGetData(String data)
+{
+  data = data.substring(data.indexOf('?')+1);
+  Serial.println("data to index: " + data);
+  int index = 0;
+  while (data.indexOf('&') > 0)
+  {
+    String pair = data.substring(0, data.indexOf('&'));
+    Serial.println("pair: " + pair + "for index: " + index);
+    requestArray[index] = pair;
+    index++;
+    data = trimRequest(data);
+    Serial.println(requestArray[index]);
+  }
+  requestArray[index] = data.substring(0);
+  Serial.println(requestArray[index]);
+}
+
+String getDeviceStatus(int deviceID)
+{
+  //ask a device for its status
+}
+
+String getAllDeviceStatus()
+{
+  String aggregatedDeviceStatus = "";
+  for (int i = 0; i <= MAX_DEVICES; i++)
+  {
+    aggregatedDeviceStatus = aggregatedDeviceStatus + getDeviceStatus(i);
+  }
+  return aggregatedDeviceStatus;
+}
+
+void processGetData()
+{
+  //check if request is empty; return basic status
+    //weatherData
+    //all device status
+  String radioReply = "";
+  for (int i = 0; i <= 9; i++)
+  {
+    if (requestArray[i].indexOf("device") > 0) 
+    {
+      webState.deviceID = getRequestValue(requestArray[i]);
+      _newData.FromRadioId = (uint8_t)webState.deviceID[0];
+      Serial.print("Reply to radio: " + _newData.FromRadioId);
+    }
+    if (requestArray[i].indexOf("cmd") > 0) 
+    {
+      webState.command = getRequestValue(requestArray[i]);
+      radioReply = radioReply + COMMAND+webState.command+"|";
+      //Serial.print("COMMAND: ");
+      //printBits(webState.command[0]);
+    }
+    if (requestArray[i].indexOf("state") > 0) 
+    {
+      webState.state = getRequestValue(requestArray[i]);
+      radioReply = radioReply + STATE+webState.state+"|";
+      //Serial.print("STATE: ");
+      //printBits(webState.state[0]);
+    }
+    if (requestArray[i].indexOf("pin") > 0) 
+    {
+      webState.pin = getRequestValue(requestArray[i]);
+      radioReply = radioReply + PIN+webState.pin+"|";
+      //Serial.print("PIN: ");
+      //printBits(webState.pin[0]);
+    }
+    if (requestArray[i].indexOf("mode") > 0) 
+    {
+      webState.pinCommand = getRequestValue(requestArray[i]);
+      radioReply = radioReply + MODE+webState.pinCommand+"|";
+      //Serial.print("MODE: ");
+      //printBits(webState.pinCommand[0]);
+    }
+    if (requestArray[i].indexOf("time") > 0) 
+    {
+      webState.pinTime = getRequestValue(requestArray[i]);
+      radioReply = radioReply + TIME+webState.pinTime+"|";
+      //Serial.print("TIME: ");
+      //Serial.println(webState.pinTime);
+    }
+  }
+  radioReply.toCharArray(_newData.Payload, radioReply.length()+1);
+  Serial.println(radioReply);
+}
+
+void clearGetData()
+{
+  for (int i = 0; i <= 9; i++)
+  {
+    requestArray[i] = "";
+  }
+}
+
+void buildWebReply()
+{
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println(""); 
+  client.println("<!DOCTYPE HTML>");
+  client.println("<html>");
+
+  //output default information here
+  client.print("Current weather: ");
+  client.print((float)temperature); Serial.print(" *C, ");
+  client.print((float)humidity); Serial.print(" RH%, ");
+  client.print(pressure/100); Serial.println(" pa");
+  client.println("<br>");
+  client.println("<hr>");
+  //output interesting information here.
+  for (int i = 0; i <= 9; i++)
+  {
+    client.println(requestArray[i]+"<br>");
+  }
+  client.println("<a href=\"/?device=2&cmd=output&state=toggle&pin=1&mode=high&time=1000\"\"><button>Open Garage </button></a>");
+  client.println("</html>");
+}
+
+void processWebRequests(String request)
+{
+    if (request.indexOf("?device") != -1)
+    {
+      char tmp = request.substring(request.indexOf('=')+1)[0];
+      request = request.substring(request.indexOf('&')+1);
+      _newData.FromRadioId = tmp;
+    }
+    if (request.indexOf("MSG=") != -1)
+    {
+      char data = B00000000;
+      for (int i = 0; i <= 3; i++)
+      {
+        if (request.substring(request.indexOf('=')+1)[i] == '1')
+        {
+          data = data | ( 1 << i );
+        } else
+        {
+          data = data | ( 0 << i );
+        }
+      }
+      sendMsg = "MSG?";
+      sendMsg = sendMsg + data;
+      sendMsg.toCharArray(_newData.Payload, sendMsg.length()+1);
+      client.println("HTTP/1.1 200 OK");
+    }
+    if (request.indexOf("CNF=") != -1)
+    {
+      char data = request.substring(request.indexOf('=')+1)[0];
+      sendMsg = "CNF?";
+      sendMsg = sendMsg + data;
+      sendMsg.toCharArray(_newData.Payload, sendMsg.length()+1);
+      client.println("HTTP/1.1 200 OK");
+    }
+    if (request.indexOf("NEW=") != -1)
+    {
+      char data = request.substring(request.indexOf('=')+1)[0];
+      sendMsg = "NEW?";
+      sendMsg = sendMsg + data;
+      sendMsg.toCharArray(_newData.Payload, sendMsg.length()+1);
+      client.println("HTTP/1.1 200 OK");
+    }
+    if (request.indexOf("INP") != -1)
+    {
+      sendMsg = "INP?";
+      sendMsg.toCharArray(_newData.Payload, sendMsg.length()+1);
+      client.println("HTTP/1.1 200 OK");
+    }
+    if (request.indexOf("INT") != -1)
+    {
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: text/html");
+      client.println(""); //  do not forget this one
+      client.println("<!DOCTYPE HTML>");
+      client.println("<html>");
+      if (inputData)
+      {
+        client.print("Input6: ");
+        client.println(input6);
+        client.print("Input7: ");
+        client.println(input7);
+        client.println("</html>");
+        inputData = false;
+      } else
+      {
+        client.println("Please call INP method");
+        client.println("</html>");
+      }
+    }
+    client.stop();
+}
+
+void loop()
+{
+  WiFiClient client = server.available();
+  //readSensors();
+  //doRadioWork();
+  //EasyDDNS.update(DDNS_UPDATE_INTERVAL);
+  if (!client) {
+    //move all non-web stuff here?
+    return;
+  }
+
+  String request = client.readStringUntil('\r');
+  //client.flush();
+  if (request != "")
+  {
+    Serial.print("New web request: ");
+    Serial.println(request);
+    //processWebRequests(request);  
+    indexGetData(request);
+    //processGetData();
+    //buildWebReply();
+    clearGetData();
+  }
+  if ((millis() - refreshMillis) >= SENSOR_REFRESH)
+  {
+    refreshMillis = millis();
+    //readSensors();
+  }
+  if ((millis() - shiftMillis) >= SENSOR_AVERAGE_INTERVAL)
+  {
+    shiftMillis = millis();
+    //shiftSensorData();
+  }
+  //1hr non-blocking timer here
+  //shiftSensorData();
+}
