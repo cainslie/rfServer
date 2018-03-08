@@ -9,11 +9,8 @@
 #include <WiFiUdp.h>
 #include <Time.h>
 #include <TimeLib.h>
+#include <D:\Repos\rfServer\rfServer.ino\credentials.access>
  
-//const char* ssid = "DevFluence";
-//const char* password = "W1ck3dsaint!!";
-const char* ssid = "Ainslie";
-const char* password = "ytsurk36552";
 const int MAX_DEVICES = 255;
 const int MAX_RETRIES = 255;
 const String DDNS_DOMAIN = "ainslie.duckdns.org";
