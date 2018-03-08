@@ -13,8 +13,6 @@
  
 const int MAX_DEVICES = 255;
 const int MAX_RETRIES = 255;
-const String DDNS_DOMAIN = "ainslie.duckdns.org";
-const String DDNS_TOKEN = "3b10c0db-7786-45d2-9413-2a283c2c91e2";
 const int DDNS_UPDATE_INTERVAL = 10000;
 const int SENSOR_REFRESH = 5000;
 const int SENSOR_AVERAGE_INTERVAL = 3600000;
